@@ -1,4 +1,4 @@
-use slint::{ModelRc, VecModel, invoke_from_event_loop};
+use slint::{ModelRc, VecModel, invoke_from_event_loop, Image};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 use std::io::{self, BufRead};
@@ -8,6 +8,7 @@ use std::str::FromStr;
 use std::path::Path;
 use std::process::Command;
 use std::env;
+use std::sync::{Arc, Mutex};
 
 use pnet::datalink::{self, NetworkInterface};
 use pnet::packet::arp::{ArpHardwareTypes, ArpOperations, MutableArpPacket};
@@ -215,24 +216,20 @@ async fn scan_network(cidr: String) -> Result<Vec<ScanResult>, String> {
 
 fn open_url(url: &str, as_root: bool) -> Result<(), String> {
     if cfg!(target_os = "linux") && as_root {
-        // Get the original user who invoked sudo
         let user = env::var("SUDO_USER")
             .map_err(|_| "SUDO_USER not set; are you running with sudo?")?;
-
-        // Get critical environment variables
         let display = env::var("DISPLAY")
-            .unwrap_or_else(|_| ":0".to_string()); // Default to :0 if not set
+            .unwrap_or_else(|_| ":0".to_string());
         let home = env::var("HOME")
-            .unwrap_or_else(|_| format!("/home/{}", user)); // Fallback to user's home
+            .unwrap_or_else(|_| format!("/home/{}", user));
         let xauthority = env::var("XAUTHORITY")
-            .unwrap_or_else(|_| format!("/home/{}/.Xauthority", user)); // Fallback path
+            .unwrap_or_else(|_| format!("/home/{}/.Xauthority", user));
 
-        // Use sudo -u with preserved environment to run xdg-open
         let status = Command::new("sudo")
             .arg("-u")
             .arg(&user)
             .env("DISPLAY", &display)
-            .env("HOME", &home) // Ensure HOME is set for browser config
+            .env("HOME", &home)
             .env("XAUTHORITY", &xauthority)
             .arg("xdg-open")
             .arg(url)
@@ -245,7 +242,6 @@ fn open_url(url: &str, as_root: bool) -> Result<(), String> {
             Err(format!("xdg-open failed with exit code: {:?}", status.code()))
         }
     } else {
-        // On Windows or non-root Linux, use open::that
         open::that(url).map_err(|e| format!("Failed to open URL: {}", e))
     }
 }
@@ -253,6 +249,20 @@ fn open_url(url: &str, as_root: bool) -> Result<(), String> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui = MainWindow::new()?;
+    let pending_url = Arc::new(Mutex::new(None::<String>));
+
+    // Set background image if it exists
+    let background_path = "background.png"; // Adjust filename as needed
+    if Path::new(background_path).exists() {
+        if let Ok(image) = Image::load_from_path(Path::new(background_path)) {
+            ui.set_background_image(image);
+            println!("Background image set to: {}", background_path);
+        } else {
+            println!("Failed to load background image '{}', using default solid background", background_path);
+        }
+    } else {
+        println!("No background image found at '{}', using default solid background", background_path);
+    }
 
     ui.window().set_size(slint::PhysicalSize::new(1000, 800));
     println!("Window size set to: {:?}", ui.window().size());
@@ -298,33 +308,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Handle HTTP button click
-    ui.on_open_http({
+    ui.on_show_warning({
         let ui_handle = ui.as_weak();
-        move |ip| {
-            if let Some(_ui) = ui_handle.upgrade() {
-                let url = format!("http://{}", ip);
-                let is_root = cfg!(target_os = "linux") && env::var("SUDO_UID").is_ok();
-                if let Err(e) = open_url(&url, is_root) {
-                    println!("Failed to open HTTP URL {}: {}", url, e);
-                } else {
-                    println!("Opened HTTP URL: {}", url);
+        move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                ui.set_popup_visible(true);
+            }
+        }
+    });
+
+    ui.on_proceed_with_url({
+        let ui_handle = ui.as_weak();
+        let pending_url = pending_url.clone();
+        move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                let url = {
+                    let mut lock = pending_url.lock().unwrap();
+                    lock.take()
+                };
+                if let Some(url) = url {
+                    let is_root = cfg!(target_os = "linux") && env::var("SUDO_UID").is_ok();
+                    if let Err(e) = open_url(&url, is_root) {
+                        println!("Failed to open URL {}: {}", url, e);
+                        ui.set_status(format!("Error opening URL: {}", e).into());
+                    } else {
+                        println!("Opened URL: {}", url);
+                    }
                 }
             }
         }
     });
 
-    // Handle HTTPS button click
+    ui.on_open_http({
+        let ui_handle = ui.as_weak();
+        let pending_url = pending_url.clone();
+        move |ip| {
+            if let Some(ui) = ui_handle.upgrade() {
+                let url = format!("http://{}", ip);
+                let is_root = cfg!(target_os = "linux") && env::var("SUDO_UID").is_ok();
+                if is_root {
+                    *pending_url.lock().unwrap() = Some(url);
+                    ui.invoke_show_warning();
+                } else {
+                    if let Err(e) = open_url(&url, false) {
+                        println!("Failed to open HTTP URL {}: {}", url, e);
+                    } else {
+                        println!("Opened HTTP URL: {}", url);
+                    }
+                }
+            }
+        }
+    });
+
     ui.on_open_https({
         let ui_handle = ui.as_weak();
+        let pending_url = pending_url.clone();
         move |ip| {
-            if let Some(_ui) = ui_handle.upgrade() {
+            if let Some(ui) = ui_handle.upgrade() {
                 let url = format!("https://{}", ip);
                 let is_root = cfg!(target_os = "linux") && env::var("SUDO_UID").is_ok();
-                if let Err(e) = open_url(&url, is_root) {
-                    println!("Failed to open HTTPS URL {}: {}", url, e);
+                if is_root {
+                    *pending_url.lock().unwrap() = Some(url);
+                    ui.invoke_show_warning();
                 } else {
-                    println!("Opened HTTPS URL: {}", url);
+                    if let Err(e) = open_url(&url, false) {
+                        println!("Failed to open HTTPS URL {}: {}", url, e);
+                    } else {
+                        println!("Opened HTTPS URL: {}", url);
+                    }
                 }
             }
         }
