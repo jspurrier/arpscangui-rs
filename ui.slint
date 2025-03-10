@@ -10,7 +10,15 @@ export component MainWindow inherits Window {
     title: "ARP Table Scanner";
     preferred-width: 1000px;
     preferred-height: 800px;
-    background: #2b2b2b;  // Solid color background
+    background: #2b2b2b; // Always solid background
+
+    // Background image (optional, no window transparency)
+    background_layer := Image {
+        source: background-image;
+        width: parent.width;
+        height: parent.height;
+        opacity: 0.25; // Fully opaque image; adjust if desired (e.g., 0.5 for 50% transparency)
+    }
 
     VerticalBox {
         width: 1000px;
@@ -63,7 +71,7 @@ export component MainWindow inherits Window {
                     Text { 
                         text: result.manufacturer;
                         color: #ffffff;
-                        width: 450px;  // Reduced width to accommodate buttons
+                        width: 450px;
                     }
                     Button {
                         text: "HTTP";
@@ -99,10 +107,44 @@ export component MainWindow inherits Window {
         }
     }
 
+    // Custom warning popup
+    warning_popup := Rectangle {
+        visible: popup-visible;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 400px;
+        height: 200px;
+        background: #333333;
+        border-color: #ffffff;
+        border-width: 2px;
+        VerticalBox {
+            padding: 20px;
+            spacing: 20px;
+            Text {
+                text: "On Linux with sudo, please close your browser before opening HTTP/HTTPS URLs to avoid conflicts.";
+                color: #ffffff;
+                font-size: 14px;
+                horizontal-alignment: center;
+            }
+            HorizontalBox {
+                spacing: 10px;
+                alignment: center;
+                Button {
+                    text: "OK";
+                    clicked => { popup-visible = false; root.proceed-with-url() }
+                }
+            }
+        }
+    }
+
     in-out property <[ScanResult]> scan-results: [];
     in-out property <string> status: "Ready";
+    in-out property <bool> popup-visible: false;
+    in-out property <image> background-image; // Only for the image layer
     callback scan-network(string);
     callback close-window();
-    callback open-http(string);  // New callback for HTTP
-    callback open-https(string);  // New callback for HTTPS
+    callback open-http(string);
+    callback open-https(string);
+    callback show-warning();
+    callback proceed-with-url();
 }
