@@ -1,0 +1,108 @@
+import { VerticalBox, HorizontalBox, LineEdit, Button } from "std-widgets.slint";
+
+export struct ScanResult {
+    ip: string,
+    mac: string,
+    manufacturer: string
+}
+
+export component MainWindow inherits Window {
+    title: "ARP Table Scanner";
+    preferred-width: 1000px;
+    preferred-height: 800px;
+    background: #2b2b2b;  // Solid color background
+
+    VerticalBox {
+        width: 1000px;
+        padding: 10px;
+        spacing: 10px;
+
+        Text {
+            text: "ARP Table Scanner";
+            color: #ffffff;
+            font-size: 24px;
+            horizontal-alignment: center;
+        }
+
+        HorizontalBox {
+            width: 400px;
+            Text {
+                text: "Network/Subnet (e.g., 192.168.1.0/24):";
+                color: #ffffff;
+                font-size: 14px;
+                vertical-alignment: center;
+            }
+            network_input := LineEdit {
+                placeholder-text: "192.168.1.0/24";
+                width: 200px;
+            }
+            Button {
+                text: "Start Scan";
+                primary: true;
+                width: 120px;
+                clicked => { root.scan-network(network_input.text) }
+            }
+        }
+
+        VerticalBox {
+            height: 600px;
+            width: 1000px;
+            for result in root.scan-results : Rectangle {
+                padding: 2px;
+                HorizontalBox {
+                    Text { 
+                        text: result.ip;
+                        color: #ffffff;
+                        width: 150px;
+                    }
+                    Text { 
+                        text: result.mac;
+                        color: #ffffff;
+                        width: 150px;
+                    }
+                    Text { 
+                        text: result.manufacturer;
+                        color: #ffffff;
+                        width: 450px;  // Reduced width to accommodate buttons
+                    }
+                    Button {
+                        text: "HTTP";
+                        width: 80px;
+                        clicked => { root.open-http(result.ip) }
+                    }
+                    Button {
+                        text: "HTTPS";
+                        width: 80px;
+                        clicked => { root.open-https(result.ip) }
+                    }
+                }
+            }
+        }
+
+        HorizontalBox {
+            width: 1000px;
+            padding-right: 20px;
+            status_text := Text {
+                text: root.status;
+                color: #00ff00;
+                font-size: 12px;
+                horizontal-alignment: left;
+                width: 880px;
+                padding-top: 18px;
+            }
+            Button {
+                text: "Close";
+                primary: true;
+                width: 100px;
+                clicked => { root.close-window() }
+            }
+        }
+    }
+
+    in-out property <[ScanResult]> scan-results: [];
+    in-out property <string> status: "Ready";
+    callback scan-network(string);
+    callback close-window();
+    callback open-http(string);  // New callback for HTTP
+    callback open-https(string);  // New callback for HTTPS
+}
