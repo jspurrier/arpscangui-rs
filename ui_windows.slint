@@ -1,81 +1,35 @@
 import { Button, VerticalBox, ListView, LineEdit, HorizontalBox } from "std-widgets.slint";
 
-// Define struct at the top
 struct ScanResult {
     ip: string,
     mac: string,
     manufacturer: string
 }
 
-// Define a custom PopupWindow component
-component PopupWindow inherits Rectangle {
-    in-out property <bool> is_visible;
-    callback proceed_with_url();
-    in-out property <bool> popup_visible;
-
-    background: rgba(50, 50, 50, 0.9);
-    border-radius: 5px;
-    border-color: gray;
-    border-width: 1px;
-    width: 400px;
-    height: 150px;
-
-    VerticalBox {
-        padding: 10px;
-        spacing: 10px;
-        Text { 
-            text: "Running as root may prevent browser opening directly. Proceed?"; 
-            color: white;
-            horizontal-alignment: center;
-        }
-        HorizontalBox {
-            alignment: center;
-            Button {
-                text: "Yes";
-                clicked => { 
-                    root.proceed_with_url(); 
-                    root.is_visible = false; 
-                    root.popup_visible = false; 
-                }
-            }
-            Button {
-                text: "No";
-                clicked => { 
-                    root.is_visible = false; 
-                    root.popup_visible = false; 
-                }
-            }
-        }
-    }
-}
-
 export component MainWindow inherits Window {
     title: "ARP Scanner";
     width: 1000px;
-    preferred-height: 600px; // More flexible height, adjusts based on content
+    preferred-height: 600px;
 
     callback close_window();
     callback scan_network(string);
-    callback show_warning();
-    callback proceed_with_url();
     callback open_http(string);
     callback open_https(string);
-    callback filter_by_mac(string);
+    callback filter_by_mac(string);  // Still named filter_by_mac for compatibility
 
-    in property <image> background_image;  // Kept for potential future use
+    in property <image> background_image;
     in-out property <string> status: "Ready";
-    in-out property <bool> popup_visible: false;
     in-out property <[ScanResult]> scan_results;
 
     VerticalBox {
         padding: 5px;
-        spacing: 0px;  // No spacing between elements
+        spacing: 0px;
         height: 100%;
 
         HorizontalBox {
             padding: 2px;
             spacing: 5px;
-            alignment: start;  // Align elements to the left
+            alignment: start;
             Text {
                 text: "Network (CIDR):";
                 vertical-alignment: center;
@@ -90,11 +44,10 @@ export component MainWindow inherits Window {
                 height: 30px;
                 clicked => { scan_network(network_input.text); }
             }
-            // Enhanced spacer to ensure "Close" is at far right
             Rectangle {
                 width: 1px;
                 height: 1px;
-                horizontal-stretch: 2;  // Push "Close" to far right
+                horizontal-stretch: 2;
             }
             Button {
                 text: "Close";
@@ -104,7 +57,6 @@ export component MainWindow inherits Window {
             }
         }
 
-        // Nested VerticalBox to tightly pack Status and Table
         VerticalBox {
             spacing: 0px;
             padding: 0px;
@@ -113,25 +65,23 @@ export component MainWindow inherits Window {
                 text: "Status: " + root.status;
                 color: white;
                 padding: 0px;
-                height: 20px;  // Constrain the height to remove extra space
+                height: 20px;
                 vertical-stretch: 0;
                 vertical-alignment: top;
             }
 
-            // Remove fixed height from Rectangle to let ListView dictate size
             Rectangle {
                 background: rgba(0, 0, 0, 0.7);
                 border-radius: 5px;
                 width: 100%;
                 padding: 0px;
-                vertical-stretch: 1; // Allow Rectangle to expand vertically
+                vertical-stretch: 1;
 
                 VerticalBox {
                     padding: 0px;
                     spacing: 0px;
                     ListView {
                         width: parent.width;
-                        // Removed height property to let VerticalBox manage it
                         for result in root.scan_results : HorizontalBox {
                             width: parent.width;
                             padding: 2px;
@@ -172,16 +122,15 @@ export component MainWindow inherits Window {
                 }
             }
 
-            // Add MAC filter input and button
             HorizontalBox {
                 padding: 2px;
                 spacing: 5px;
                 Text {
-                    text: "Filter by MAC:";
+                    text: "Filter by MAC/Manufacturer:";
                     vertical-alignment: center;
                 }
                 mac_filter_input := LineEdit {
-                    placeholder-text: "e.g., 00:0a:95:9d:68:16";
+                    placeholder-text: "e.g., 00:0a or Apple";
                     width: 150px;
                 }
                 Button {
@@ -192,13 +141,5 @@ export component MainWindow inherits Window {
                 }
             }
         }
-    }
-
-    popup := PopupWindow {
-        is_visible: root.popup_visible;
-        popup_visible <=> root.popup_visible;
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        proceed_with_url => { root.proceed_with_url(); }
     }
 }

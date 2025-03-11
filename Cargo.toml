@@ -7,12 +7,23 @@ edition = "2021"
 pnet = "0.34.0"
 rand = "0.8.5"
 lazy_static = "1.4.0"
-slint = "1.7"  # Adding Slint for GUI
+slint = "1.10"  # Adding Slint for GUI
 tokio = { version = "1.38", features = ["full"] }  # For async runtime
 open = "5.3.0"
+log = "0.4"           # Logging crate
+env_logger = "0.11"   # Console logging implementation
 
 [build-dependencies]
 slint-build = "1.10.0"
+winres = "0.1"  # For embedding Windows manifest
+
+[features]
+windows-no-popup = []
+
+# Embed the manifest for Windows
+
+[package.metadata.winres]
+manifest-file = "arpscangui-rs.exe.manifest"
 
 # No additional dependencies needed for build.rs
 
