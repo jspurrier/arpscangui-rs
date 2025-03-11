@@ -1,4 +1,6 @@
-use slint::{ModelRc, VecModel, invoke_from_event_loop, Image};
+#![cfg_attr(feature = "windows-no-popup", windows_subsystem = "windows")]
+
+use slint::{ModelRc, VecModel, invoke_from_event_loop, Image, Model};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 use std::io::{self, BufRead};
@@ -17,6 +19,13 @@ use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
 
 use lazy_static::lazy_static;
+use log::{info, error, debug};
+use env_logger::Builder;
+
+// Store original scan results to restore when filter is cleared
+lazy_static! {
+    static ref ORIGINAL_RESULTS: Arc<Mutex<Vec<ScanResult>>> = Arc::new(Mutex::new(Vec::new()));
+}
 
 slint::include_modules!();
 
@@ -55,14 +64,36 @@ fn get_manufacturer(mac: &MacAddr) -> String {
 }
 
 fn get_default_interface() -> Option<NetworkInterface> {
-    datalink::interfaces()
-        .into_iter()
-        .find(|iface| {
-            iface.is_up() 
-            && !iface.is_loopback() 
-            && !iface.ips.is_empty()
-            && iface.mac.is_some()
-        })
+    let interfaces = datalink::interfaces();
+    info!("Found {} network interfaces", interfaces.len());
+    
+    if interfaces.is_empty() {
+        error!("No network interfaces detected by pnet");
+    }
+
+    for iface in &interfaces {
+        let up = iface.is_up();
+        let loopback = iface.is_loopback();
+        let has_ips = !iface.ips.is_empty();
+        let has_mac = iface.mac.is_some();
+        
+        debug!(
+            "Interface: {}\n  Up: {}\n  Loopback: {}\n  IPs: {:?}\n  MAC: {:?}\n  Suitable: {}",
+            iface.name, up, loopback, iface.ips, iface.mac, 
+            up && !loopback && has_ips && has_mac
+        );
+    }
+
+    let selected = interfaces.into_iter().find(|iface| {
+        !iface.is_loopback() 
+        && iface.ips.iter().any(|ip| ip.is_ipv4() && ip.ip() != Ipv4Addr::new(0, 0, 0, 0))
+    });
+
+    match &selected {
+        Some(iface) => info!("Selected interface: {}", iface.name),
+        None => error!("No suitable interface found after filtering"),
+    }
+    selected
 }
 
 fn parse_cidr(cidr: &str) -> Result<(Ipv4Addr, u32), String> {
@@ -93,7 +124,10 @@ fn u32_to_ip(n: u32) -> Ipv4Addr {
 }
 
 async fn scan_network(cidr: String) -> Result<Vec<ScanResult>, String> {
+    info!("Starting network scan for CIDR: {}", cidr);
+
     if !Path::new("oui.txt").exists() {
+        error!("oui.txt file not found");
         return Err("oui.txt file not found. Ensure it’s in the same directory as the executable.".to_string());
     }
 
@@ -101,10 +135,11 @@ async fn scan_network(cidr: String) -> Result<Vec<ScanResult>, String> {
     let interface = get_default_interface()
         .ok_or_else(|| {
             let os_msg = if cfg!(target_os = "windows") {
-                "No suitable network interface found. Ensure you’re running with administrative privileges."
+                "No suitable network interface found. Ensure Npcap is installed, run as Administrator, and check if your network adapter is active (e.g., via 'ipconfig')."
             } else {
                 "No suitable network interface found. Ensure you’re running with root privileges (e.g., sudo)."
             };
+            error!("{}", os_msg);
             os_msg.to_string()
         })?;
 
@@ -121,16 +156,24 @@ async fn scan_network(cidr: String) -> Result<Vec<ScanResult>, String> {
 
     let network_u32 = ip_to_u32(network) & !(0xFFFFFFFF >> mask);
     let host_count = 1 << (32 - mask);
-    
+
+    // First scan pass
     let (mut tx, mut rx) = match datalink::channel(&interface, Default::default()) {
-        Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => return Err("Unhandled channel type".to_string()),
+        Ok(datalink::Channel::Ethernet(tx, rx)) => {
+            info!("Ethernet channel created successfully for interface {}", interface.name);
+            (tx, rx)
+        },
+        Ok(_) => {
+            error!("Unhandled channel type");
+            return Err("Unhandled channel type".to_string())
+        },
         Err(e) => {
             let os_msg = if cfg!(target_os = "windows") {
-                format!("Failed to create channel: {}. Ensure you’re running as Administrator.", e)
+                format!("Failed to create channel: {}. Ensure Npcap is installed and run as Administrator.", e)
             } else {
                 format!("Failed to create channel: {}. Ensure you’re running with sudo.", e)
             };
+            error!("{}", os_msg);
             return Err(os_msg);
         }
     };
@@ -165,11 +208,15 @@ async fn scan_network(cidr: String) -> Result<Vec<ScanResult>, String> {
         ethernet_packet.set_payload(arp_packet.packet_mut());
 
         if tx.send_to(ethernet_packet.packet(), None).is_none() {
-            println!("Warning: Failed to send packet to {}", target_ip);
+            debug!("Failed to send packet to {}", target_ip);
+        } else {
+            debug!("Sent ARP request to {}", target_ip);
         }
     }
 
-    while start_time.elapsed() < Duration::from_secs(5) {
+    // Increased timeout for more consistent results
+    let timeout = if cfg!(target_os = "windows") { Duration::from_secs(20) } else { Duration::from_secs(15) };
+    while start_time.elapsed() < timeout {
         match rx.next() {
             Ok(packet) => {
                 if let Some(ethernet) = pnet::packet::ethernet::EthernetPacket::new(packet) {
@@ -179,6 +226,7 @@ async fn scan_network(cidr: String) -> Result<Vec<ScanResult>, String> {
                                 let ip = arp.get_sender_proto_addr();
                                 let mac = arp.get_sender_hw_addr();
                                 results.insert(ip, mac);
+                                debug!("Received ARP reply from {} with MAC {}", ip, mac);
                             }
                         }
                     }
@@ -186,13 +234,85 @@ async fn scan_network(cidr: String) -> Result<Vec<ScanResult>, String> {
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::TimedOut {
+                    info!("Receive timeout reached in first pass");
                     break;
                 }
-                println!("Warning: Failed to receive packet: {}", e);
+                debug!("Failed to receive packet: {}", e);
                 continue;
             }
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Second scan pass for IPs that didn't respond
+    let missing_ips: Vec<Ipv4Addr> = (1..host_count - 1)
+        .map(|i| u32_to_ip(network_u32 + i))
+        .filter(|ip| !results.contains_key(ip))
+        .collect();
+
+    if !missing_ips.is_empty() {
+        info!("Starting second scan pass for {} IPs that didn't respond", missing_ips.len());
+        let start_time = Instant::now();
+
+        for target_ip in missing_ips {
+            let mut ethernet_buffer = [0u8; 42];
+            let mut ethernet_packet = MutableEthernetPacket::new(&mut ethernet_buffer)
+                .ok_or("Failed to create ethernet packet")?;
+
+            ethernet_packet.set_destination(MacAddr::broadcast());
+            ethernet_packet.set_source(source_mac);
+            ethernet_packet.set_ethertype(EtherTypes::Arp);
+
+            let mut arp_buffer = [0u8; 28];
+            let mut arp_packet = MutableArpPacket::new(&mut arp_buffer)
+                .ok_or("Failed to create ARP packet")?;
+
+            arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
+            arp_packet.set_protocol_type(EtherTypes::Ipv4);
+            arp_packet.set_hw_addr_len(6);
+            arp_packet.set_proto_addr_len(4);
+            arp_packet.set_operation(ArpOperations::Request);
+            arp_packet.set_sender_hw_addr(source_mac);
+            arp_packet.set_sender_proto_addr(source_ip);
+            arp_packet.set_target_hw_addr(MacAddr::zero());
+            arp_packet.set_target_proto_addr(target_ip);
+
+            ethernet_packet.set_payload(arp_packet.packet_mut());
+
+            if tx.send_to(ethernet_packet.packet(), None).is_none() {
+                debug!("Failed to send packet to {} in second pass", target_ip);
+            } else {
+                debug!("Sent ARP request to {} in second pass", target_ip);
+            }
+        }
+
+        while start_time.elapsed() < timeout {
+            match rx.next() {
+                Ok(packet) => {
+                    if let Some(ethernet) = pnet::packet::ethernet::EthernetPacket::new(packet) {
+                        if ethernet.get_ethertype() == EtherTypes::Arp {
+                            if let Some(arp) = pnet::packet::arp::ArpPacket::new(ethernet.payload()) {
+                                if arp.get_operation() == ArpOperations::Reply {
+                                    let ip = arp.get_sender_proto_addr();
+                                    let mac = arp.get_sender_hw_addr();
+                                    results.insert(ip, mac);
+                                    debug!("Received ARP reply from {} with MAC {} in second pass", ip, mac);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::TimedOut {
+                        info!("Receive timeout reached in second pass");
+                        break;
+                    }
+                    debug!("Failed to receive packet in second pass: {}", e);
+                    continue;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     let mut scan_results: Vec<ScanResult> = results.into_iter().map(|(ip, mac)| {
@@ -210,7 +330,11 @@ async fn scan_network(cidr: String) -> Result<Vec<ScanResult>, String> {
         ip_a.cmp(&ip_b)
     });
 
-    println!("Scan completed with {} results", scan_results.len());
+    // Store the original results for filtering
+    let mut original = ORIGINAL_RESULTS.lock().unwrap();
+    *original = scan_results.clone();
+
+    info!("Scan completed with {} results", scan_results.len());
     Ok(scan_results)
 }
 
@@ -246,32 +370,75 @@ fn open_url(url: &str, as_root: bool) -> Result<(), String> {
     }
 }
 
+fn normalize_mac(mac: &str) -> String {
+    mac.to_lowercase().replace([':', '-', ' '], "")
+}
+
+fn filter_results_by_mac_or_manufacturer(results: Vec<ScanResult>, filter: &str) -> Vec<ScanResult> {
+    let normalized_filter = normalize_mac(filter); // Normalize the filter input
+    info!("Filtering with normalized filter: {}", normalized_filter); // Debug log
+    if normalized_filter.is_empty() {
+        // If filter is empty, return the original results
+        let original = ORIGINAL_RESULTS.lock().unwrap();
+        return original.clone();
+    }
+
+    results.into_iter().filter(|result| {
+        let normalized_mac = normalize_mac(&result.mac);
+        let normalized_manufacturer = result.manufacturer.to_lowercase();
+        let matches_mac = normalized_mac.contains(&normalized_filter);
+        let matches_manufacturer = normalized_manufacturer.contains(&normalized_filter);
+        if matches_mac {
+            info!("Match found in MAC: {} for filter {}", normalized_mac, normalized_filter);
+        }
+        if matches_manufacturer {
+            info!("Match found in manufacturer: {} for filter {}", normalized_manufacturer, normalized_filter);
+        }
+        matches_mac || matches_manufacturer
+    }).collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if cfg!(target_os = "windows") {
+        let log_file = File::create("arpscangui.log").expect("Failed to create log file");
+        Builder::from_default_env()
+            .target(env_logger::Target::Pipe(Box::new(log_file)))
+            .init();
+    } else {
+        env_logger::init();
+    }
+    info!("Application starting");
+
     let ui = MainWindow::new()?;
     let pending_url = Arc::new(Mutex::new(None::<String>));
 
-    // Set background image if it exists
-    let background_path = "background.png"; // Adjust filename as needed
+    let background_path = "background.png";
     if Path::new(background_path).exists() {
         if let Ok(image) = Image::load_from_path(Path::new(background_path)) {
             ui.set_background_image(image);
-            println!("Background image set to: {}", background_path);
+            info!("Background image set to: {}", background_path);
         } else {
-            println!("Failed to load background image '{}', using default solid background", background_path);
+            error!("Failed to load background image '{}'", background_path); // Fixed macro invocation
         }
     } else {
-        println!("No background image found at '{}', using default solid background", background_path);
+        info!("No background image found at '{}'", background_path);
     }
 
-    ui.window().set_size(slint::PhysicalSize::new(1000, 800));
-    println!("Window size set to: {:?}", ui.window().size());
+    ui.window().set_size(slint::PhysicalSize::new(1000, 600));
+    info!("Window size set to: {:?}", ui.window().size());
+
+    #[cfg(not(feature = "windows-no-popup"))]
+    {
+        ui.set_popup_visible(false);
+        info!("Popup visibility set to false on non-Windows build");
+    }
 
     ui.on_close_window({
         let ui_handle = ui.as_weak();
         move || {
             if let Some(ui) = ui_handle.upgrade() {
-                ui.window().hide();
+                let _ = ui.window().hide();
             }
         }
     });
@@ -280,12 +447,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ui_handle = ui.as_weak();
         move |network| {
             if let Some(ui) = ui_handle.upgrade() {
-                ui.set_status("Running".into());
-                println!("Status set to Running");
+                ui.set_status("Scanning...".into());
+                info!("Scan initiated for network: {}", network);
                 let ui_handle_clone = ui_handle.clone();
                 let network = network.to_string();
                 tokio::spawn(async move {
-                    let result = scan_network(network).await;
+                    let result = crate::scan_network(network).await;
                     invoke_from_event_loop(move || {
                         if let Some(ui) = ui_handle_clone.upgrade() {
                             match result {
@@ -293,14 +460,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let model = VecModel::from(results);
                                     ui.set_scan_results(ModelRc::new(model));
                                     ui.set_status("Scan Complete".into());
-                                    println!("Status set to Scan Complete");
+                                    info!("Scan completed successfully");
                                 }
                                 Err(e) => {
                                     ui.set_status(format!("Error: {}", e).into());
                                     ui.set_scan_results(ModelRc::new(VecModel::default()));
-                                    println!("Status set to Error: {}", e);
+                                    error!("Scan failed: {}", e);
                                 }
                             }
+                        } else {
+                            error!("UI handle upgrade failed");
                         }
                     }).expect("Failed to invoke UI update from event loop");
                 });
@@ -308,52 +477,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    ui.on_show_warning({
-        let ui_handle = ui.as_weak();
-        move || {
-            if let Some(ui) = ui_handle.upgrade() {
-                ui.set_popup_visible(true);
-            }
-        }
-    });
-
-    ui.on_proceed_with_url({
-        let ui_handle = ui.as_weak();
-        let pending_url = pending_url.clone();
-        move || {
-            if let Some(ui) = ui_handle.upgrade() {
-                let url = {
-                    let mut lock = pending_url.lock().unwrap();
-                    lock.take()
-                };
-                if let Some(url) = url {
-                    let is_root = cfg!(target_os = "linux") && env::var("SUDO_UID").is_ok();
-                    if let Err(e) = open_url(&url, is_root) {
-                        println!("Failed to open URL {}: {}", url, e);
-                        ui.set_status(format!("Error opening URL: {}", e).into());
+    #[cfg(not(feature = "windows-no-popup"))]
+    {
+        ui.on_show_warning({
+            let ui_handle = ui.as_weak();
+            move || {
+                if let Some(ui) = ui_handle.upgrade() {
+                    let is_root = env::var("SUDO_UID").is_ok();
+                    info!("Checking warning: is_root={}", is_root);
+                    if is_root {
+                        info!("Showing popup: Linux with root privileges detected");
+                        ui.set_popup_visible(true);
                     } else {
-                        println!("Opened URL: {}", url);
+                        info!("Suppressing popup: Not root");
+                        ui.set_popup_visible(false);
                     }
                 }
             }
-        }
-    });
+        });
+
+        ui.on_proceed_with_url({
+            let ui_handle = ui.as_weak();
+            let pending_url = pending_url.clone();
+            move || {
+                if let Some(ui) = ui_handle.upgrade() {
+                    let url = {
+                        let mut lock = pending_url.lock().unwrap();
+                        lock.take()
+                    };
+                    if let Some(url) = url {
+                        let is_root = env::var("SUDO_UID").is_ok();
+                        if let Err(e) = crate::open_url(&url, is_root) {
+                            error!("Failed to open URL {}: {}", url, e);
+                            ui.set_status(format!("Error opening URL: {}", e).into());
+                        } else {
+                            info!("Opened URL: {}", url);
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     ui.on_open_http({
         let ui_handle = ui.as_weak();
-        let pending_url = pending_url.clone();
+        let _pending_url = pending_url.clone(); // Renamed to _pending_url to indicate it's unused
         move |ip| {
-            if let Some(ui) = ui_handle.upgrade() {
+            if let Some(_ui) = ui_handle.upgrade() { // Renamed to _ui to indicate it's unused
                 let url = format!("http://{}", ip);
-                let is_root = cfg!(target_os = "linux") && env::var("SUDO_UID").is_ok();
-                if is_root {
-                    *pending_url.lock().unwrap() = Some(url);
-                    ui.invoke_show_warning();
-                } else {
-                    if let Err(e) = open_url(&url, false) {
-                        println!("Failed to open HTTP URL {}: {}", url, e);
+                #[cfg(feature = "windows-no-popup")]
+                {
+                    info!("Opening HTTP URL directly: Running on Windows");
+                    if let Err(e) = crate::open_url(&url, false) {
+                        error!("Failed to open HTTP URL {}: {}", url, e);
                     } else {
-                        println!("Opened HTTP URL: {}", url);
+                        info!("Opened HTTP URL: {}", url);
+                    }
+                }
+                #[cfg(not(feature = "windows-no-popup"))]
+                {
+                    let is_root = env::var("SUDO_UID").is_ok();
+                    if is_root {
+                        info!("Pending HTTP URL: Linux with root privileges detected");
+                        *_pending_url.lock().unwrap() = Some(url);
+                        _ui.invoke_show_warning();
+                    } else {
+                        info!("Opening HTTP URL directly: Not root");
+                        if let Err(e) = crate::open_url(&url, false) {
+                            error!("Failed to open HTTP URL {}: {}", url, e);
+                        } else {
+                            info!("Opened HTTP URL: {}", url);
+                        }
                     }
                 }
             }
@@ -362,21 +556,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ui.on_open_https({
         let ui_handle = ui.as_weak();
-        let pending_url = pending_url.clone();
+        let _pending_url = pending_url.clone(); // Renamed to _pending_url to indicate it's unused
         move |ip| {
-            if let Some(ui) = ui_handle.upgrade() {
+            if let Some(_ui) = ui_handle.upgrade() { // Renamed to _ui to indicate it's unused
                 let url = format!("https://{}", ip);
-                let is_root = cfg!(target_os = "linux") && env::var("SUDO_UID").is_ok();
-                if is_root {
-                    *pending_url.lock().unwrap() = Some(url);
-                    ui.invoke_show_warning();
-                } else {
-                    if let Err(e) = open_url(&url, false) {
-                        println!("Failed to open HTTPS URL {}: {}", url, e);
+                #[cfg(feature = "windows-no-popup")]
+                {
+                    info!("Opening HTTPS URL directly: Running on Windows");
+                    if let Err(e) = crate::open_url(&url, false) {
+                        error!("Failed to open HTTPS URL {}: {}", url, e);
                     } else {
-                        println!("Opened HTTPS URL: {}", url);
+                        info!("Opened HTTPS URL: {}", url);
                     }
                 }
+                #[cfg(not(feature = "windows-no-popup"))]
+                {
+                    let is_root = env::var("SUDO_UID").is_ok();
+                    if is_root {
+                        info!("Pending HTTPS URL: Linux with root privileges detected");
+                        *_pending_url.lock().unwrap() = Some(url);
+                        _ui.invoke_show_warning();
+                    } else {
+                        info!("Opening HTTPS URL directly: Not root");
+                        if let Err(e) = crate::open_url(&url, false) {
+                            error!("Failed to open HTTPS URL {}: {}", url, e);
+                        } else {
+                            info!("Opened HTTPS URL: {}", url);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    ui.on_filter_by_mac({
+        let ui_handle = ui.as_weak();
+        move |filter| {
+            if let Some(ui) = ui_handle.upgrade() {
+                let current_results = ui.get_scan_results().iter().collect::<Vec<ScanResult>>();
+                let filtered_results = crate::filter_results_by_mac_or_manufacturer(current_results, &filter);
+                let model = VecModel::from(filtered_results);
+                ui.set_scan_results(ModelRc::new(model));
+                info!("Filtered results by: {}", filter);
             }
         }
     });
